@@ -4,26 +4,26 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.distributed as dist
-os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+os.environ['TOKENIZERS_PARALLELISM'] = 'true' # 启动tokenizer并行化
 
 model_path = "/data2/Qwen/Qwen2.5-7B"
-beta = 0.03
-num_pre_Q = 8
-Q_batch_size = 1
+beta = 0.03 # GRPO 中的 KL 散度权重参数
+num_pre_Q = 8 # 每个问题生成的候选答案数量
+Q_batch_size = 1  # 每批次的问题数量
 all_steps = 1000
-max_prompt_length = 400   
+max_prompt_length = 400
 save_steps = 200
 
 ds_config = {
-    "train_micro_batch_size_per_gpu": Q_batch_size*num_pre_Q,
-    "gradient_accumulation_steps": 2,
+    "train_micro_batch_size_per_gpu": Q_batch_size*num_pre_Q,  # 每个 GPU 的微批量大小
+    "gradient_accumulation_steps": 2,  # 梯度累积步数
     "optimizer": {
         "type": "AdamW",
         "params": { "lr": 1e-6 }
     },
     "bf16": {"enabled": True},
     "zero_optimization": {
-        "stage": 1,
+        "stage": 1, # 使用 ZeRO stage 1
         "allgather_partitions": True,
         "allgather_bucket_size": 2e8,
         "overlap_comm": True,
@@ -31,7 +31,7 @@ ds_config = {
         "reduce_bucket_size": 2e8,
         "contiguous_gradients": True,
         "stage3_gather_16bit_weights_on_model_save": True,
-        "offload_optimizer": {"device": "cpu"}
+        "offload_optimizer": {"device": "cpu"} # 空闲自动加载优化器到cpu
     }
 }
 
@@ -39,7 +39,11 @@ ref_server = "http://localhost:59875"
 from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
 
 def get_batch():
+    '''
+        从ref_server请求一个batch的数据
+    '''
     try:
+        # http.get获取数据集的一个batch (ref_server)
         r = requests.get(f"{ref_server}/get").content
         if r == b'empty': return None
     except: return None
@@ -50,6 +54,9 @@ def get_batch():
     data['refs'] = bytes_to_tensor(dd[3])
     return data
 
+'''
+    在线加载tokenizer model dataset
+'''
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(model_path, 
         torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
@@ -58,8 +65,12 @@ gen_model = model
 from datasets import load_dataset
 #dataset = load_dataset("meta-math/GSM8K_zh", "default", split="train")
 dataset = load_dataset("openai/gsm8k", "main", split="train")
+# map dataset to {'Q': XX, 'A':XX}
 QAs = [{'Q':x, 'A':y.split('####')[-1].strip()} for x,y in zip(dataset['question'], dataset['answer'])]
 
+'''
+    config
+'''
 from transformers import GenerationConfig
 generation_config = GenerationConfig(
             max_new_tokens=512,
@@ -70,6 +81,8 @@ generation_config = GenerationConfig(
 
 system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
 The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+
+# 根据输入问题生成答案
 def gen_answers(prompts):
     tip_text = []
     for x in prompts:
@@ -87,6 +100,8 @@ def gen_answers(prompts):
     return answers
 
 
+# 计算正确性奖励：验证答案是否正确
+################################## TO DO
 from math_verify import parse, verify, ExprExtractionConfig
 def reward_correct(item, answer):
     pattern = r'\d+\.\d+|\d+/\d+|\d+'
@@ -96,12 +111,14 @@ def reward_correct(item, answer):
     ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
     ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
     return 1 if verify(ans, ground_truth) else -1
+# 计算格式奖励：验证答案是否正确
+################################## TO DO
 def reward_format(item, answer):
     # pattern = r"^<think>(?:(?!</?think>)[\s\S]*?)</think>\s*<answer>(?:(?!</?answer>)[\s\S]*?)</answer><\|im_end\|>$"
     pattern = r"^<think>.*?</think><answer>.*?</answer>$"
     return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) else -1
 
-
+# 根据输入采样多个答案，并计算总奖励
 def gen_samples(inputs):
     prompts = [x["Q"] for x in inputs]
     answers = gen_answers(prompts)
@@ -109,7 +126,7 @@ def gen_samples(inputs):
     rewards = []
     for i, inp in enumerate(inputs):
         for a in answers[i*num_pre_Q:(i+1)*num_pre_Q]:
-            rewards.append(reward_correct(inp, a) + reward_format(inp, a))
+            rewards.append(reward_correct(inp, a) + reward_format(inp, a)) # 奖励为正确性奖励和格式奖励之和
     prompts_text = [tokenizer.apply_chat_template([
              {"role": "system", "content": system_prompt},
              {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
